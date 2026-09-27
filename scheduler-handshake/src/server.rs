@@ -1,7 +1,7 @@
 use {
     crate::{
-        AgaveCheckWorkerSession, AgaveHandshakeError, AgaveTpuToPackSession, AgaveWorkerSession,
-        ClientLogon, ProtocolVersions,
+        AgaveCheckWorkerSession, AgaveHandshakeError, AgaveSimulationWorkerSession,
+        AgaveTpuToPackSession, AgaveWorkerSession, ClientLogon, ProtocolVersions,
         shared::{
             AgaveSession, GLOBAL_ALLOCATORS, HUGE_PAGE_SIZE, LOGON_FAILURE, LOGON_SUCCESS,
             PageSize, checked_file_size,
@@ -9,6 +9,7 @@ use {
     },
     agave_scheduler_bindings::{
         CheckWorkerToPackMessage, PackToCheckWorkerMessage, PackToExecutionWorkerMessage,
+        PackToSimulationWorkerMessage, SimulationWorkerToPackMessage,
     },
     nix::sys::socket::{self, ControlMessage, MsgFlags, UnixAddr},
     rts_alloc::Allocator,
@@ -30,6 +31,17 @@ type RtsAllocError = rts_alloc::error::Error;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const SHMEM_NAME: &CStr = c"/agave-scheduler-bindings";
+
+/// Non-Linux targets create shared memory through a fixed `shm_open` name, so concurrent
+/// session setup (e.g. parallel tests) races on that name. Serialize setup there; Linux uses
+/// anonymous `memfd_create` and needs no lock.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "l4re",
+    target_os = "android",
+    target_os = "emscripten"
+)))]
+static SHMEM_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Implements the Agave side of the scheduler bindings handshake protocol.
 pub struct Server {
@@ -143,9 +155,19 @@ impl Server {
         logon: ClientLogon,
     ) -> Result<(AgaveSession, Vec<File>), AgaveHandshakeError> {
         logon.validate()?;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "l4re",
+            target_os = "android",
+            target_os = "emscripten"
+        )))]
+        let _shmem_setup_guard = SHMEM_SETUP_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Setup the allocator in shared memory (`worker_count`, `check_worker_count`, and
-        // `allocator_handles` have been validated so this won't panic).
+        // Setup the allocator in shared memory (`worker_count`, `check_worker_count`,
+        // `simulation_worker_count`, and `allocator_handles` have been validated so this won't
+        // panic).
         let (allocator_file, tpu_to_pack_allocator) = Self::create_allocator(&logon)?;
 
         // Setup the global queues.
@@ -162,6 +184,15 @@ impl Server {
                 logon.check_worker_to_pack_capacity,
                 PageSize::Huge,
             )?;
+        let (pack_to_simulation_worker_file, pack_to_simulation_worker) =
+            Self::create_mpmc_consumer::<PackToSimulationWorkerMessage>(
+                logon.pack_to_simulation_worker_capacity,
+            )?;
+        let (simulation_worker_to_pack_file, simulation_worker_to_pack) =
+            Self::create_mpmc_producer::<SimulationWorkerToPackMessage>(
+                logon.simulation_worker_to_pack_capacity,
+                PageSize::Huge,
+            )?;
 
         let check_workers = (0..logon.check_worker_count)
             .map(|_| {
@@ -169,6 +200,16 @@ impl Server {
                     allocator: Allocator::join_from_existing(&tpu_to_pack_allocator)?,
                     pack_to_check_worker: pack_to_check_worker.clone(),
                     check_worker_to_pack: check_worker_to_pack.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, AgaveHandshakeError>>()?;
+
+        let simulation_workers = (0..logon.simulation_worker_count)
+            .map(|_| {
+                Ok(AgaveSimulationWorkerSession {
+                    allocator: Allocator::join_from_existing(&tpu_to_pack_allocator)?,
+                    pack_to_simulation_worker: pack_to_simulation_worker.clone(),
+                    simulation_worker_to_pack: simulation_worker_to_pack.clone(),
                 })
             })
             .collect::<Result<Vec<_>, AgaveHandshakeError>>()?;
@@ -204,6 +245,7 @@ impl Server {
                 },
                 progress_tracker,
                 check_workers,
+                simulation_workers,
                 workers,
             },
             [
@@ -212,6 +254,8 @@ impl Server {
                 progress_tracker_file,
                 pack_to_check_worker_file,
                 check_worker_to_pack_file,
+                pack_to_simulation_worker_file,
+                simulation_worker_to_pack_file,
             ]
             .into_iter()
             .chain(worker_files)
@@ -224,6 +268,8 @@ impl Server {
             .checked_add(logon.worker_count)
             .unwrap()
             .checked_add(logon.check_worker_count)
+            .unwrap()
+            .checked_add(logon.simulation_worker_count)
             .unwrap()
             .checked_add(logon.allocator_handles)
             .unwrap();

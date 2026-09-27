@@ -1,7 +1,8 @@
 use {
     agave_scheduler_bindings::{
         CheckWorkerToPackMessage, ExecutionWorkerToPackMessage, PackToCheckWorkerMessage,
-        PackToExecutionWorkerMessage, ProgressMessage, TpuToPackMessage,
+        PackToExecutionWorkerMessage, PackToSimulationWorkerMessage, ProgressMessage,
+        SimulationWorkerToPackMessage, TpuToPackMessage,
     },
     rts_alloc::Allocator,
     std::fmt,
@@ -30,9 +31,13 @@ pub(crate) enum PageSize {
 }
 
 impl PageSize {
-    pub(crate) const fn bytes(self) -> usize {
+    pub(crate) fn bytes(self) -> usize {
         match self {
-            Self::Standard => STANDARD_PAGE_SIZE,
+            Self::Standard => {
+                // SAFETY: `sysconf` is thread-safe and takes no pointer arguments.
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                usize::try_from(page_size).unwrap_or(STANDARD_PAGE_SIZE)
+            }
             Self::Huge => HUGE_PAGE_SIZE,
         }
     }
@@ -112,6 +117,15 @@ pub struct ClientLogon {
     pub pack_to_check_worker_capacity: usize,
     /// The minimum capacity of the check-worker-to-scheduler queue in messages.
     pub check_worker_to_pack_capacity: usize,
+    /// The number of Agave simulation worker threads that will be spawned to handle bundle
+    /// simulation requests. May be zero if the external scheduler does not simulate bundles.
+    pub simulation_worker_count: usize,
+    /// The minimum capacity of the scheduler-to-simulation-worker queue in messages.
+    /// Must be non-zero even if `simulation_worker_count` is zero.
+    pub pack_to_simulation_worker_capacity: usize,
+    /// The minimum capacity of the simulation-worker-to-scheduler queue in messages.
+    /// Must be non-zero even if `simulation_worker_count` is zero.
+    pub simulation_worker_to_pack_capacity: usize,
     /// Flags that control the behavior of the new scheduling session.
     pub flags: u64,
     // NB: If adding more fields please ensure:
@@ -135,6 +149,12 @@ impl ClientLogon {
         if !(1..=MAX_WORKERS).contains(&self.check_worker_count) {
             return Err(AgaveHandshakeError::CheckWorkerCount(
                 self.check_worker_count,
+            ));
+        }
+
+        if self.simulation_worker_count > MAX_WORKERS {
+            return Err(AgaveHandshakeError::SimulationWorkerCount(
+                self.simulation_worker_count,
             ));
         }
 
@@ -183,6 +203,18 @@ impl ClientLogon {
             shaq::mpmc::try_minimum_file_size::<CheckWorkerToPackMessage>,
             PageSize::Huge,
         )?;
+        validate_queue_capacity(
+            "pack_to_simulation_worker_capacity",
+            self.pack_to_simulation_worker_capacity,
+            shaq::mpmc::try_minimum_file_size::<PackToSimulationWorkerMessage>,
+            PageSize::Huge,
+        )?;
+        validate_queue_capacity(
+            "simulation_worker_to_pack_capacity",
+            self.simulation_worker_to_pack_capacity,
+            shaq::mpmc::try_minimum_file_size::<SimulationWorkerToPackMessage>,
+            PageSize::Huge,
+        )?;
 
         Ok(())
     }
@@ -229,6 +261,8 @@ pub struct ClientSession {
     pub progress_tracker: shaq::spsc::Consumer<ProgressMessage>,
     pub pack_to_check_worker: shaq::mpmc::Producer<PackToCheckWorkerMessage>,
     pub check_worker_to_pack: shaq::mpmc::Consumer<CheckWorkerToPackMessage>,
+    pub pack_to_simulation_worker: shaq::mpmc::Producer<PackToSimulationWorkerMessage>,
+    pub simulation_worker_to_pack: shaq::mpmc::Consumer<SimulationWorkerToPackMessage>,
     pub workers: Vec<ClientWorkerSession>,
 }
 
@@ -270,6 +304,7 @@ pub struct AgaveSession {
     pub tpu_to_pack: AgaveTpuToPackSession,
     pub progress_tracker: shaq::spsc::Producer<ProgressMessage>,
     pub check_workers: Vec<AgaveCheckWorkerSession>,
+    pub simulation_workers: Vec<AgaveSimulationWorkerSession>,
     pub workers: Vec<AgaveWorkerSession>,
 }
 
@@ -291,6 +326,13 @@ pub struct AgaveCheckWorkerSession {
     pub allocator: Allocator,
     pub pack_to_check_worker: shaq::mpmc::Consumer<PackToCheckWorkerMessage>,
     pub check_worker_to_pack: shaq::mpmc::Producer<CheckWorkerToPackMessage>,
+}
+
+/// Shared memory objects for a single bundle simulation worker.
+pub struct AgaveSimulationWorkerSession {
+    pub allocator: Allocator,
+    pub pack_to_simulation_worker: shaq::mpmc::Consumer<PackToSimulationWorkerMessage>,
+    pub simulation_worker_to_pack: shaq::mpmc::Producer<SimulationWorkerToPackMessage>,
 }
 
 /// Potential errors that can occur during the Agave side of the handshake.
@@ -315,6 +357,8 @@ pub enum AgaveHandshakeError {
     WorkerCount(usize),
     #[error("Check worker count; count={0}")]
     CheckWorkerCount(usize),
+    #[error("Simulation worker count; count={0}")]
+    SimulationWorkerCount(usize),
     #[error("Allocator handles; count={0}")]
     AllocatorHandles(usize),
     #[error("Allocator size cannot be represented; size={0}")]
