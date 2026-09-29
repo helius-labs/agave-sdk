@@ -31,13 +31,9 @@ pub(crate) enum PageSize {
 }
 
 impl PageSize {
-    pub(crate) fn bytes(self) -> usize {
+    pub(crate) const fn bytes(self) -> usize {
         match self {
-            Self::Standard => {
-                // SAFETY: `sysconf` is thread-safe and takes no pointer arguments.
-                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-                usize::try_from(page_size).unwrap_or(STANDARD_PAGE_SIZE)
-            }
+            Self::Standard => STANDARD_PAGE_SIZE,
             Self::Huge => HUGE_PAGE_SIZE,
         }
     }

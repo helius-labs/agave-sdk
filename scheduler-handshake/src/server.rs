@@ -32,17 +32,6 @@ type RtsAllocError = rts_alloc::error::Error;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const SHMEM_NAME: &CStr = c"/agave-scheduler-bindings";
 
-/// Non-Linux targets create shared memory through a fixed `shm_open` name, so concurrent
-/// session setup (e.g. parallel tests) races on that name. Serialize setup there; Linux uses
-/// anonymous `memfd_create` and needs no lock.
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "l4re",
-    target_os = "android",
-    target_os = "emscripten"
-)))]
-static SHMEM_SETUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Implements the Agave side of the scheduler bindings handshake protocol.
 pub struct Server {
     listener: UnixListener,
@@ -155,15 +144,6 @@ impl Server {
         logon: ClientLogon,
     ) -> Result<(AgaveSession, Vec<File>), AgaveHandshakeError> {
         logon.validate()?;
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "l4re",
-            target_os = "android",
-            target_os = "emscripten"
-        )))]
-        let _shmem_setup_guard = SHMEM_SETUP_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Setup the allocator in shared memory (`worker_count`, `check_worker_count`,
         // `simulation_worker_count`, and `allocator_handles` have been validated so this won't
